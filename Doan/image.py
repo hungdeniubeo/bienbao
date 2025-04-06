@@ -10,6 +10,9 @@ import tensorflow as tf
 from keras.models import load_model
 from playsound import playsound
 import pygame
+import subprocess
+import os
+import sys
 # Load mô hình nhận diện biển báo
 model = load_model('traffic_sign_model.h5')
 
@@ -55,7 +58,7 @@ def get_label(label):
 
 # Tạo giao diện
 top = tk.Tk()
-top.geometry('800x600')
+top.geometry(f"1000x700+{(top.winfo_screenwidth() - 1000) // 2}+{(top.winfo_screenheight() - 700) // 2}")
 img = PhotoImage(file='traffic-light.png')
 top.iconphoto(False,img)
 top.title('Hệ thống nhận dạng biển báo giao thông')
@@ -316,6 +319,33 @@ def edit_label(index,   on_close=None):
 
 def del_img():
     pass
+
+# Hàm để chạy webcam.py
+def open_webcam():
+    try:
+        # Lưu trạng thái hiện tại của giao diện
+        top.iconify()  # Thu nhỏ cửa sổ hiện tại
+        
+        # Lấy đường dẫn hiện tại của script
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        webcam_path = os.path.join(current_dir, 'webcam.py')
+        
+        # Kiểm tra nếu file webcam.py tồn tại
+        if os.path.exists(webcam_path):
+            # Chạy script webcam.py trong một tiến trình riêng biệt
+            if sys.platform.startswith('win'):
+                subprocess.Popen(['python', webcam_path], shell=True)
+            else:
+                subprocess.Popen(['python3', webcam_path])
+            
+            # Thông báo cho người dùng
+            messagebox.showinfo("Webcam", "Đang mở chế độ webcam. Nhấn 'q' để thoát khỏi chế độ webcam.")
+        else:
+            messagebox.showerror("Lỗi", f"Không tìm thấy file webcam.py tại {webcam_path}")
+    except Exception as e:
+        messagebox.showerror("Lỗi", f"Không thể mở webcam: {str(e)}")
+    finally:
+        top.deiconify()  # Khôi phục cửa sổ hiện tại sau khi đóng webcam
    
 frame_buttons = tk.Frame(top, bg=top["bg"])
 frame_buttons.pack(side=BOTTOM,pady=50)
@@ -343,6 +373,14 @@ edit_btn = Button(frame_buttons, text="Sửa biển báo", command=open_edit_lab
                  relief="raised", bd=2, cursor="hand2")
 edit_btn.pack(side=LEFT, padx=12, pady=5)
 
+# Thêm nút webcam
+webcam_btn = Button(top, text="Webcam", command=open_webcam, padx=10, pady=8,
+                    background='#e91e63', foreground='white', font=('Arial', 10, 'bold'),
+                    relief="raised", bd=2, cursor="hand2")
+
+webcam_btn.place(relx=0.1, rely=0.46)
+
+
 reset_btn = Button(frame_buttons, text="🔄", command=reset_image, padx=12, pady=8, \
                  background='#abb794', foreground='white', font=('Arial', 15, 'bold'), \
                  relief="raised", bd=2, cursor="hand2")  
@@ -356,5 +394,4 @@ heading = Label(top, text="Nhận dạng biển báo giao thông bằng hình �
 heading.configure(background='#CDCDCD', foreground='#364156')
 heading.pack()
 
-top.geometry(f"800x600+{(top.winfo_screenwidth() - 800) // 2}+{(top.winfo_screenheight() - 600) // 2}")
 top.mainloop()
