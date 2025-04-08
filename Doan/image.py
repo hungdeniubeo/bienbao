@@ -13,6 +13,24 @@ import pygame
 import subprocess
 import os
 import sys
+import mysql.connector
+
+def connect_db():
+    try:
+        mydb = mysql.connector.connect(
+            host="localhost",
+            user="root",
+            password="kimem1702",
+            database="image_db"
+        )
+        if mydb.is_connected():
+            print("✅ Kết nối MySQL thành công.")
+    except mysql.connector.Error as e:
+        print(f"❌ Lỗi kết nối MySQL: {e}")
+
+# 🟢 Gọi hàm kiểm tra
+connect_db()
+
 # Load mô hình nhận diện biển báo
 model = load_model('traffic_sign_model.h5')
 
