@@ -9,51 +9,79 @@ import numpy as np
 import tensorflow as tf
 from keras.models import load_model
 from playsound import playsound
-import pygame
 import subprocess
 import os
 import sys
 import mysql.connector
+from mysql.connector import Error
 
 def connect_db():
-    try:
-        mydb = mysql.connector.connect(
-            host="localhost",
-            user="root",
-            password="kimem1702",
-            database="image_db"
-        )
-        if mydb.is_connected():
-            print("✅ Kết nối MySQL thành công.")
-    except mysql.connector.Error as e:
-        print(f"❌ Lỗi kết nối MySQL: {e}")
-
-# 🟢 Gọi hàm kiểm tra
-connect_db()
+    mydb = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="kimem1702",
+        database="image_db"
+    )
+    return mydb
+    
+def get_labels_from_db():
+    connection = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="kimem1702",
+        database="image_db"
+    )
+    cursor = connection.cursor(dictionary=True)
+    cursor.execute("SELECT id, class_id, class_name FROM labels")
+    labels = cursor.fetchall()
+    cursor.close()
+    connection.close()
+    return labels
 
 # Load mô hình nhận diện biển báo
 model = load_model('traffic_sign_model.h5')
 
-labels_file = "labels.json"
-
 classify_b = None
 
-# Load labels from labels.json
-def load_labels():
-    try:
-        with open(labels_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-# Save labels to labels.json
-def save_labels():
-    with open(labels_file, "w", encoding="utf-8") as f:
-        json.dump(classNames, f, indent=4)
-
-classNames = load_labels()
+labels = get_labels_from_db()
+classNames = [label['class_name'] for label in labels]
 
 current_image_path = None  # Lưu ảnh vừa tải lên
+
+def insert_label(class_id, class_name):
+    """
+    Thêm một label mới vào bảng labels.
+    Trả về label_id nếu thành công, ngược lại trả về None.
+    """
+    try:
+        connection = connect_db()
+        cursor = connection.cursor()
+        query = "INSERT INTO labels (class_id, class_name) VALUES (%s, %s)"
+        cursor.execute(query, (class_id, class_name))
+        connection.commit()
+        label_id = cursor.lastrowid  # Lấy ID tự tăng của label vừa thêm
+        cursor.close()
+        connection.close()
+        return label_id
+    except mysql.connector.Error as e:
+        messagebox.showerror("Lỗi", f"Không thể thêm label: {e}")
+        return None
+
+def insert_image(title, description, path, label_id):
+    """
+    Thêm một hình ảnh mới vào bảng images.
+    """
+    try:
+        connection = connect_db()
+        cursor = connection.cursor()
+        query = "INSERT INTO images (title, description, path, label_id) VALUES (%s, %s, %s, %s)"
+        cursor.execute(query, (title, description, path, label_id))
+        connection.commit()
+        cursor.close()
+        connection.close()
+    except mysql.connector.Error as e:
+        messagebox.showerror("Lỗi", f"Không thể thêm hình ảnh: {e}")
+
 
 def get_image_hash(image): # Nếu ảnh đã có trước, lấy ra xử lý nhanh lại
     hasher = hashlib.sha256()  
@@ -157,7 +185,7 @@ def check_image_existence():
     Y_pred = model.predict([image])[0]
     max_prob = np.max(Y_pred)  # Lấy xác suất cao nhất
     detected = str(np.argmax(Y_pred))  # Nhãn dự đoán
-    labels = load_labels()
+    labels = get_labels_from_db()
     if detected in labels and max_prob > 0.7:
         response = messagebox.askyesno("Thông báo","Ảnh đã có trong hệ thống, bạn chỉ có thể sửa thông tin!\nBạn có muốn sửa không?")
         if response:
@@ -180,23 +208,21 @@ def add_label():
     sign_image.configure(image=im)
     sign_image.image = im
     
-    # Kiểm tra xem ảnh đã tồn tại trong hệ thống chưa
+    # Kiểm tra xem ảnh đã tồn tại trong hệ thống chưa (giữ nguyên phần kiểm tra dự đoán)
     image = Image.open(current_image_path).resize((32, 32))
     image = np.array(image).reshape(-1, 32, 32, 3)
     image = np.array(list(map(preprocessing, image))).reshape(-1, 32, 32, 1)
 
     Y_pred = model.predict([image])[0]
-    max_prob = np.max(Y_pred)  # Lấy xác suất cao nhất
-    detected = str(np.argmax(Y_pred))  # Nhãn dự đoán
+    max_prob = np.max(Y_pred)  # Xác suất cao nhất
+    predicted_index = int(np.argmax(Y_pred))  # Nhãn dự đoán dưới dạng số
     
-    # Nếu ảnh đã có trong hệ thống với độ tin cậy cao (>= 0.7)
-    if detected in classNames and max_prob >= 0.7:
+    if predicted_index in [int(label['class_id']) for label in get_labels_from_db()] and max_prob >= 0.7:
         messagebox.showinfo("Thông báo", "Biển báo này đã có trong hệ thống, không thể thêm mới!")
         response = messagebox.askyesno("Thông báo", "Bạn có muốn sửa thông tin biển báo này không?")
         if response:
-            edit_label(detected, on_close=lambda: classify(current_image_path))
+            edit_label(str(predicted_index), on_close=lambda: classify(current_image_path))
         else:
-            # Hiển thị nút nhận diện nếu người dùng không muốn sửa
             show_classify_button(current_image_path)
         return
 
@@ -232,28 +258,33 @@ def add_label():
         image = np.array(image).reshape(-1, 32, 32, 3)
         image = np.array(list(map(preprocessing, image))).reshape(-1, 32, 32, 1)
         Y_pred = model.predict([image])[0]
-        predicted_index = str(np.argmax(Y_pred))
+        predicted_index = int(np.argmax(Y_pred))
         
-        # Tìm ID mới cho biển báo
-        available_ids = [int(k) for k in classNames.keys() if k.isdigit()]
-        new_id = str(max(available_ids) + 1) if available_ids else "0"
+        # Tạo text label theo định dạng mong muốn
+        label_text = f"{category}\n{name}"
         
-        # Lưu thông tin biển báo mới
-        classNames[new_id] = f"{category}\n{name}"
-        save_labels()
+        # Thêm label vào bảng labels
+        label_id = insert_label(predicted_index, label_text)
+        if label_id is None:
+            return  # Thông báo lỗi đã được hiển thị trong insert_label()
+        
+        # Sau khi thêm label, thêm thông tin hình ảnh vào bảng images
+        title = name  # Bạn có thể thay đổi theo ý muốn
+        description = ""  # Hoặc bổ sung mô tả nếu cần
+        insert_image(title, description, current_image_path, label_id)
+        
         messagebox.showinfo("Thông báo", "Thêm thành công!")
         add_window.destroy()
         show_classify_button(current_image_path)
         
-        # Cập nhật hiển thị sau khi thêm
-        label_text = f"{category}\n{name}"
+        # Cập nhật giao diện hiển thị biển báo
         label.configure(foreground='#011638', text=label_text)
         
-        # Lưu ý cho người dùng về việc phải huấn luyện lại mô hình
+        # Thông báo cho người dùng rằng có thể cần huấn luyện lại mô hình
         messagebox.showinfo("Lưu ý", "Biển báo đã được thêm vào cơ sở dữ liệu, nhưng mô hình cần được huấn luyện lại để nhận diện chính xác loại biển báo này trong tương lai.")
     
     tk.Button(add_window, text="Thêm", command=save_label, bg="green", fg="white").pack(pady=10)
-        
+       
 def open_edit_label():
     global current_image_path
     if not current_image_path:
@@ -267,7 +298,7 @@ def open_edit_label():
     Y_pred = model.predict([image])[0]
     detected_index = str(np.argmax(Y_pred))  # Lấy index dự đoán từ mô hình
 
-    labels = load_labels()
+    labels = get_labels_from_db()
     if detected_index in labels:
         edit_label(detected_index, on_close=lambda: classify(current_image_path))  # Cập nhật sau khi sửa
     else:
@@ -290,8 +321,7 @@ def reset_image():
         classify_b = None
 
 def edit_label(index,   on_close=None):
-    labels = load_labels()
-
+    labels = get_labels_from_db()
     if index not in labels:
         messagebox.showerror("Lỗi", "Không tìm thấy biển báo để sửa!")
         return
@@ -326,9 +356,8 @@ def edit_label(index,   on_close=None):
             return
 
         labels[index] = f"{new_category}\n{new_name}"  # Lưu cả danh mục và tên biển báo
-        save_labels()
         messagebox.showinfo("Thông báo", "Sửa thành công!")
-        print(f"Labels sau khi sửa: {load_labels()}")
+        print(f"Labels sau khi sửa: {get_labels_from_db()}")
         edit_window.destroy()
         if on_close:
             on_close()
@@ -357,7 +386,7 @@ def open_webcam():
                 subprocess.Popen(['python3', webcam_path])
             
             # Thông báo cho người dùng
-            messagebox.showinfo("Webcam", "Đang mở chế độ webcam. Nhấn 'q' để thoát khỏi chế độ webcam.")
+            messagebox.showinfo("Webcam", "Đang mở chế độ webcam. Nhấn 'Esc' để thoát khỏi chế độ webcam.")
         else:
             messagebox.showerror("Lỗi", f"Không tìm thấy file webcam.py tại {webcam_path}")
     except Exception as e:
@@ -368,7 +397,7 @@ def open_webcam():
 frame_buttons = tk.Frame(top, bg=top["bg"])
 frame_buttons.pack(side=BOTTOM,pady=50)
 
-spacer = tk.Frame(frame_buttons, width=55, bg=top["bg"])
+spacer = tk.Frame(frame_buttons, width=50, bg=top["bg"])
 spacer.pack(side=RIGHT)  
 
 del_btn = Button(frame_buttons, text="Xóa biển báo", command=del_img, padx=15, pady=8, \
