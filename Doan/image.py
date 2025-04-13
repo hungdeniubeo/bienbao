@@ -14,6 +14,15 @@ import os
 import sys
 import mysql.connector
 from mysql.connector import Error
+import threading
+from keras.utils.np_utils import to_categorical
+from keras.optimizers import Adam
+
+def preprocess_for_training(img):
+    """Tiền xử lý ảnh cho quá trình huấn luyện"""
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = cv2.equalizeHist(img)
+    return img / 255
 
 def connect_db():
     mydb = mysql.connector.connect(
@@ -23,7 +32,6 @@ def connect_db():
         database="image_db"
     )
     return mydb
-    
 def get_labels_from_db():
     connection = mysql.connector.connect(
         host="localhost",
@@ -36,23 +44,172 @@ def get_labels_from_db():
     labels = cursor.fetchall()
     cursor.close()
     connection.close()
-    return labels
+    
+    # Chuyển đổi kết quả thành dictionary với class_id là key
+    labels_dict = {}
+    for label in labels:
+        labels_dict[str(label['class_id'])] = label['class_name']
+    return labels_dict
 
+def fine_tune_model(new_images, new_labels, model_path='traffic_sign_model.h5', epochs=5):
+    """Fine-tune mô hình hiện có với dữ liệu mới"""
+    from keras.models import load_model
+    import numpy as np
+    
+    # Lấy số lượng lớp từ cơ sở dữ liệu
+    connection = connect_db()
+    cursor = connection.cursor()
+    cursor.execute("SELECT COUNT(DISTINCT class_id) as num_classes FROM labels")
+    num_classes = cursor.fetchone()[0]
+    cursor.close()
+    connection.close()
+    
+    # Load mô hình đã được huấn luyện
+    model = load_model(model_path)
+    
+    # Chuẩn bị dữ liệu mới
+    processed_images = []
+    for img in new_images:
+        img = preprocess_for_training(img)
+        processed_images.append(img)
+    
+    new_images = np.array(processed_images)
+    new_images = new_images.reshape(-1, 32, 32, 1)
+    new_labels = to_categorical(new_labels, num_classes)
+    
+    # Đặt tỷ lệ học thấp hơn cho fine-tuning
+    model.compile(optimizer=Adam(learning_rate=0.0001), 
+                 loss='categorical_crossentropy', 
+                 metrics=['accuracy'])
+    
+    # Fine-tune mô hình với dữ liệu mới
+    history = model.fit(new_images, new_labels, 
+                      batch_size=16, 
+                      epochs=epochs, 
+                      validation_split=0.2,
+                      shuffle=True)
+    
+    # Lưu mô hình đã fine-tune
+    model.save(model_path)
+    return model
+
+def update_model_from_db():
+    """Cập nhật mô hình với dữ liệu mới từ database"""
+    try:
+        connection = connect_db()
+        cursor = connection.cursor(dictionary=True)
+        
+        # Đảm bảo có cột trained trong bảng images
+        try:
+            cursor.execute("SHOW COLUMNS FROM images LIKE 'trained'")
+            result = cursor.fetchone()
+            if not result:
+                cursor.execute("ALTER TABLE images ADD COLUMN trained TINYINT DEFAULT 0")
+                connection.commit()
+        except mysql.connector.Error:
+            # Tạo cột trained nếu chưa tồn tại
+            cursor.execute("ALTER TABLE images ADD COLUMN trained TINYINT DEFAULT 0")
+            connection.commit()
+        
+        # Lấy các ảnh đã thêm chưa được sử dụng để huấn luyện
+        cursor.execute("SELECT images.path, labels.class_id FROM images JOIN labels ON images.label_id = labels.id WHERE images.trained = 0")
+        new_data = cursor.fetchall()
+        
+        if not new_data:
+            messagebox.showinfo("Thông báo", "Không có dữ liệu mới để cập nhật mô hình!")
+            return False
+            
+        # Chuẩn bị dữ liệu
+        new_images = []
+        new_labels = []
+        
+        for item in new_data:
+            img = cv2.imread(item['path'])
+            if img is None:
+                messagebox.showerror("Lỗi", f"Không thể đọc ảnh từ đường dẫn: {item['path']}")
+                continue
+                
+            img = cv2.resize(img, (32, 32))
+            new_images.append(img)
+            new_labels.append(item['class_id'])
+        
+        if not new_images:
+            messagebox.showinfo("Thông báo", "Không có ảnh hợp lệ để cập nhật mô hình!")
+            return False
+            
+        # Cập nhật mô hình
+        global model
+        model = fine_tune_model(new_images, new_labels, epochs=3)       
+        
+        # Đánh dấu các ảnh đã được huấn luyện
+        cursor.execute("UPDATE images SET trained = 1 WHERE trained = 0")
+        connection.commit()
+        cursor.close()
+        connection.close()
+        
+        return True
+    except Exception as e:
+        messagebox.showerror("Lỗi", f"Không thể cập nhật mô hình: {str(e)}")
+        return False
+
+def update_model():
+    """Hàm cập nhật mô hình khi nhấn nút"""
+    # Tạo cửa sổ progress
+    progress_window = tk.Toplevel(top)
+    progress_window.title("Đang cập nhật mô hình...")
+    progress_window.geometry("300x100")
+    progress_window.resizable(False, False)
+    x = (top.winfo_screenwidth() - 300) // 2
+    y = (top.winfo_screenheight() - 100) // 2
+    progress_window.geometry(f"+{x}+{y}")
+    
+    tk.Label(progress_window, text="Đang cập nhật mô hình, vui lòng đợi...").pack(pady=10)
+    progress_bar = ttk.Progressbar(progress_window, orient="horizontal", mode="indeterminate")
+    progress_bar.pack(fill=tk.X, padx=20)
+    progress_bar.start()
+    
+    # Thực hiện cập nhật trong một luồng riêng biệt
+    def update_thread():
+        success = update_model_from_db()
+        progress_window.destroy()
+        if success:
+            messagebox.showinfo("Thành công", "Mô hình đã được cập nhật thành công!")
+            # Cập nhật lại danh sách nhãn
+            global labels, classNames
+            labels = get_labels_from_db()
+            classNames = labels
+        
+    thread = threading.Thread(target=update_thread)
+    thread.daemon = True
+    thread.start()
+
+global labels
+# Khởi tạo labels
+labels = get_labels_from_db()
+classNames = labels  # classNames giờ là dictionary với key là class_id
 # Load mô hình nhận diện biển báo
 model = load_model('traffic_sign_model.h5')
-
 classify_b = None
-
-labels = get_labels_from_db()
-classNames = [label['class_name'] for label in labels]
-
 current_image_path = None  # Lưu ảnh vừa tải lên
+is_recognized = False      # Trạng thái nhận diện ảnh
+
+def preprocess_image(file_path):
+    """Tiền xử lý ảnh từ đường dẫn file"""
+    image = Image.open(file_path)
+    image = image.resize((32, 32))
+    image = np.array(image).reshape(-1, 32, 32, 3)
+    image = np.array(list(map(preprocessing, image)))
+    image = image.reshape(-1, 32, 32, 1)
+    return image
+
+def predict_label(processed_image):
+    """Dự đoán nhãn từ ảnh đã xử lý"""
+    Y_pred = model.predict([processed_image])[0]
+    max_prob = np.max(Y_pred)
+    predicted_index = np.argmax(Y_pred)
+    return str(predicted_index), max_prob
 
 def insert_label(class_id, class_name):
-    """
-    Thêm một label mới vào bảng labels.
-    Trả về label_id nếu thành công, ngược lại trả về None.
-    """
     try:
         connection = connect_db()
         cursor = connection.cursor()
@@ -68,9 +225,6 @@ def insert_label(class_id, class_name):
         return None
 
 def insert_image(title, description, path, label_id):
-    """
-    Thêm một hình ảnh mới vào bảng images.
-    """
     try:
         connection = connect_db()
         cursor = connection.cursor()
@@ -115,33 +269,25 @@ sign_image = Label(image_frame, bg="#E0E0E0")
 
 def classify(file_path):
     global is_recognized
-    image = Image.open(file_path) 
-    image = image.resize((32, 32))
-    image = np.array(image) # chuyển ảnh thành mảng numpy
-
-    image = np.array(image).reshape(-1, 32, 32, 3)
-    image = np.array(list(map(preprocessing, image)))
-    image = image.reshape(-1, 32, 32, 1)
+    processed_image = preprocess_image(file_path)
+    predicted_index, max_prob = predict_label(processed_image)
     
-    Y_pred = model.predict([image])[0]
-    max_prob = np.max(Y_pred)
-    index = np.argmax(Y_pred)
-    
-    if str(index) in classNames:
-        sign = classNames[str(index)]
-        # Xử lý trường hợp định dạng khác nhau trong classNames
-        if "\n" in sign:
-            type_text, sign_name = sign.split("\n", 1)
-            label.configure(foreground='#011638', text=(type_text + "\n" + sign_name))
+    if max_prob >= 0.7:  # Chỉ nhận diện khi độ tin cậy đủ cao
+        if predicted_index in classNames:
+            sign = classNames[predicted_index]
+            # Xử lý trường hợp định dạng khác nhau trong classNames
+            if "\n" in sign:
+                type_text, sign_name = sign.split("\n", 1)
+                label.configure(foreground='#011638', text=(type_text + "\n" + sign_name))
+            else:
+                type_text = get_label(int(predicted_index))
+                label.configure(foreground='#011638', text=(type_text + "\n" + sign))
+            is_recognized = True  # Đánh dấu ảnh đã được nhận diện
         else:
-            type_text = get_label(index)
-            label.configure(foreground='#011638', text=(type_text + "\n" + sign))
-        is_recognized = True  # Đánh dấu ảnh đã được nhận diện
-    elif max_prob < 0.7:
-        label.configure(foreground='#011638', text="Ảnh mới, chưa nhận diện")
+            label.configure(foreground='#011638', text="Biển báo chưa được đăng ký")
     else:
-        label.configure(foreground='#011638', text="Không xác định")
-            
+        label.configure(foreground='#011638', text="Độ tin cậy thấp (< 70%)")
+
 def preprocessing(img):
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     img = cv2.equalizeHist(img)
@@ -178,73 +324,98 @@ def check_image_existence():
         messagebox.showerror("Lỗi", "Không có ảnh nào được chọn!")
         return False
 
-    image = Image.open(current_image_path).resize((32, 32))
-    image = np.array(image).reshape(-1, 32, 32, 3)
-    image = np.array(list(map(preprocessing, image))).reshape(-1, 32, 32, 1)
-
-    Y_pred = model.predict([image])[0]
-    max_prob = np.max(Y_pred)  # Lấy xác suất cao nhất
-    detected = str(np.argmax(Y_pred))  # Nhãn dự đoán
-    labels = get_labels_from_db()
-    if detected in labels and max_prob > 0.7:
+    processed_image = preprocess_image(current_image_path)
+    detected_index, max_prob = predict_label(processed_image)
+    
+    if detected_index in labels and max_prob > 0.7:
         response = messagebox.askyesno("Thông báo","Ảnh đã có trong hệ thống, bạn chỉ có thể sửa thông tin!\nBạn có muốn sửa không?")
         if response:
-            edit_label(detected, on_close=lambda: classify(current_image_path))
+            edit_label(detected_index, on_close=lambda: classify(current_image_path))
         else:
             show_classify_button(current_image_path)
         return True
+    return False
 
 def add_label():
-    global current_image_path
-    if not current_image_path:
+    global current_image_path, labels
+    
+    # Biến để xác định nguồn ảnh (ảnh hiện tại hoặc ảnh mới)
+    selected_image_path = None
+    
+    # Nếu đã có ảnh, hỏi người dùng có muốn dùng ảnh hiện tại hay không
+    if current_image_path:
+        response = messagebox.askyesno("Thông báo", 
+                                      "Bạn có muốn dùng ảnh hiện tại để thêm biển báo không?\n(Chọn 'No' để tải ảnh mới)")
+        if response:
+            selected_image_path = current_image_path
+        else:
+            file_path = filedialog.askopenfilename()
+            if not file_path:
+                return  # Người dùng đã hủy việc chọn file
+            selected_image_path = file_path
+            # Cập nhật current_image_path và hiển thị ảnh mới
+            current_image_path = selected_image_path
+    else:
+        # Nếu chưa có ảnh, mở hộp thoại chọn file
         file_path = filedialog.askopenfilename()
         if not file_path:
-            return
-        current_image_path = file_path  
-        
-    uploaded = Image.open(current_image_path)
+            return  # Người dùng đã hủy việc chọn file
+        selected_image_path = file_path
+        current_image_path = selected_image_path
+    
+    # Hiển thị ảnh đã chọn
+    uploaded = Image.open(selected_image_path)
     uploaded.thumbnail(((top.winfo_width() / 2.25), (top.winfo_height() / 2.25)))
     im = ImageTk.PhotoImage(uploaded)
     sign_image.configure(image=im)
     sign_image.image = im
     
-    # Kiểm tra xem ảnh đã tồn tại trong hệ thống chưa (giữ nguyên phần kiểm tra dự đoán)
-    image = Image.open(current_image_path).resize((32, 32))
-    image = np.array(image).reshape(-1, 32, 32, 3)
-    image = np.array(list(map(preprocessing, image))).reshape(-1, 32, 32, 1)
-
-    Y_pred = model.predict([image])[0]
-    max_prob = np.max(Y_pred)  # Xác suất cao nhất
-    predicted_index = int(np.argmax(Y_pred))  # Nhãn dự đoán dưới dạng số
+    # Kiểm tra xem ảnh đã tồn tại trong hệ thống chưa
+    processed_image = preprocess_image(selected_image_path)
+    predicted_index, max_prob = predict_label(processed_image)
     
-    if predicted_index in [int(label['class_id']) for label in get_labels_from_db()] and max_prob >= 0.7:
+    if predicted_index in labels and max_prob >= 0.7:
         messagebox.showinfo("Thông báo", "Biển báo này đã có trong hệ thống, không thể thêm mới!")
         response = messagebox.askyesno("Thông báo", "Bạn có muốn sửa thông tin biển báo này không?")
         if response:
-            edit_label(str(predicted_index), on_close=lambda: classify(current_image_path))
+            edit_label(predicted_index, on_close=lambda: classify(selected_image_path))
         else:
-            show_classify_button(current_image_path)
+            show_classify_button(selected_image_path)
         return
 
     # Nếu ảnh chưa có trong hệ thống hoặc có độ tin cậy thấp, cho phép thêm mới
     add_window = tk.Toplevel(top)
     add_window.title("Thêm biển báo")
-    add_window.geometry('200x150')
+    add_window.geometry('300x200')
+    add_window.resizable(False, False)
     add_window.update_idletasks()
     x = (top.winfo_screenwidth() - add_window.winfo_reqwidth()) // 2
     y = (top.winfo_screenheight() - add_window.winfo_reqheight()) // 2
     add_window.geometry(f"+{x}+{y}")
     
-    tk.Label(add_window, text="Chọn loại biển báo:").pack()
+    # Tạo frame chứa các controls
+    form_frame = tk.Frame(add_window, padx=10, pady=10)
+    form_frame.pack(fill=tk.BOTH, expand=True)
+    
+    tk.Label(form_frame, text="Chọn loại biển báo:", anchor="w").pack(fill=tk.X, pady=(0, 5))
     category_var = tk.StringVar()
-    category_combobox = ttk.Combobox(add_window, textvariable=category_var, 
-                                     values=["Biển báo cấm", "Biển báo bắt buộc", "Biển báo nguy hiểm", "Biển báo khác"])
-    category_combobox.pack()
+    category_combobox = ttk.Combobox(form_frame, textvariable=category_var, 
+                                   values=["Biển báo cấm", "Biển báo bắt buộc", "Biển báo nguy hiểm", "Biển báo khác"])
+    category_combobox.pack(fill=tk.X, pady=(0, 10))
     category_combobox.current(0)
     
-    tk.Label(add_window, text="Nhập tên biển báo:").pack()
-    name_entry = tk.Entry(add_window)
-    name_entry.pack()
+    tk.Label(form_frame, text="Nhập tên biển báo:", anchor="w").pack(fill=tk.X, pady=(0, 5))
+    name_entry = tk.Entry(form_frame)
+    name_entry.pack(fill=tk.X, pady=(0, 15))
+    
+    # Hiển thị thông tin dự đoán nếu có
+    if max_prob > 0:
+        prediction_text = f"Loại biển báo dự đoán: {max_prob*100:.1f}% tin cậy"
+        tk.Label(form_frame, text=prediction_text, fg="blue").pack(fill=tk.X, pady=(0, 10))
+    
+    # Frame chứa các nút
+    button_frame = tk.Frame(form_frame)
+    button_frame.pack(fill=tk.X)
     
     def save_label():
         category = category_var.get()
@@ -254,36 +425,49 @@ def add_label():
             return 
         
         # Lấy lại dự đoán cho ảnh hiện tại
-        image = Image.open(current_image_path).resize((32, 32))
-        image = np.array(image).reshape(-1, 32, 32, 3)
-        image = np.array(list(map(preprocessing, image))).reshape(-1, 32, 32, 1)
-        Y_pred = model.predict([image])[0]
-        predicted_index = int(np.argmax(Y_pred))
+        processed_image = preprocess_image(selected_image_path)
+        predicted_index, _ = predict_label(processed_image)
         
         # Tạo text label theo định dạng mong muốn
         label_text = f"{category}\n{name}"
         
         # Thêm label vào bảng labels
-        label_id = insert_label(predicted_index, label_text)
+        label_id = insert_label(int(predicted_index), label_text)
         if label_id is None:
             return  # Thông báo lỗi đã được hiển thị trong insert_label()
         
         # Sau khi thêm label, thêm thông tin hình ảnh vào bảng images
         title = name  # Bạn có thể thay đổi theo ý muốn
-        description = ""  # Hoặc bổ sung mô tả nếu cần
-        insert_image(title, description, current_image_path, label_id)
+        description = category  # Sử dụng loại biển báo làm mô tả
+        insert_image(title, description, selected_image_path, label_id)
         
         messagebox.showinfo("Thông báo", "Thêm thành công!")
         add_window.destroy()
-        show_classify_button(current_image_path)
+        show_classify_button(selected_image_path)
         
         # Cập nhật giao diện hiển thị biển báo
         label.configure(foreground='#011638', text=label_text)
         
+        # Cập nhật danh sách labels và classNames
+        global labels, classNames
+        labels = get_labels_from_db()
+        classNames = labels
+        
         # Thông báo cho người dùng rằng có thể cần huấn luyện lại mô hình
-        messagebox.showinfo("Lưu ý", "Biển báo đã được thêm vào cơ sở dữ liệu, nhưng mô hình cần được huấn luyện lại để nhận diện chính xác loại biển báo này trong tương lai.")
+        update_response = messagebox.askyesno("Lưu ý", "Biển báo đã được thêm vào cơ sở dữ liệu, nhưng mô hình cần được huấn luyện lại để nhận diện chính xác loại biển báo này trong tương lai.")
+
+        if update_response:
+            update_model()
+        
+    # Nút hủy
+    cancel_btn = tk.Button(button_frame, text="Hủy", command=add_window.destroy, 
+                         bg="#f44336", fg="white", padx=15)
+    cancel_btn.pack(side=tk.RIGHT, padx=5)
     
-    tk.Button(add_window, text="Thêm", command=save_label, bg="green", fg="white").pack(pady=10)
+    # Nút thêm
+    add_btn = tk.Button(button_frame, text="Thêm", command=save_label, 
+                       bg="#4CAF50", fg="white", padx=15)
+    add_btn.pack(side=tk.RIGHT)
        
 def open_edit_label():
     global current_image_path
@@ -291,21 +475,17 @@ def open_edit_label():
         messagebox.showerror("Lỗi", "Cần tải ảnh lên trước khi sửa")
         return
 
-    image = Image.open(current_image_path).resize((32, 32))
-    image = np.array(image).reshape(-1, 32, 32, 3)
-    image = np.array(list(map(preprocessing, image))).reshape(-1, 32, 32, 1)
-
-    Y_pred = model.predict([image])[0]
-    detected_index = str(np.argmax(Y_pred))  # Lấy index dự đoán từ mô hình
+    processed_image = preprocess_image(current_image_path)
+    detected_index, _ = predict_label(processed_image)  # Sử dụng _ vì không cần max_prob
 
     labels = get_labels_from_db()
     if detected_index in labels:
-        edit_label(detected_index, on_close=lambda: classify(current_image_path))  # Cập nhật sau khi sửa
+        edit_label(detected_index, on_close=lambda: classify(current_image_path))
     else:
         messagebox.showerror("Lỗi", "Không tìm thấy biển báo để sửa!")
   
 def reset_image():
-    global current_image_path, classify_b, is_recognized, custom_labels
+    global current_image_path, classify_b, is_recognized
 
     # Xóa đường dẫn ảnh hiện tại và reset trạng thái nhận diện
     current_image_path = None  
@@ -320,13 +500,14 @@ def reset_image():
         classify_b.destroy()
         classify_b = None
 
-def edit_label(index,   on_close=None):
-    labels = get_labels_from_db()
-    if index not in labels:
+def edit_label(index, on_close=None):
+    global labels
+    
+    if str(index) not in labels:
         messagebox.showerror("Lỗi", "Không tìm thấy biển báo để sửa!")
         return
 
-    label_text = labels[index]
+    label_text = labels[str(index)]
     category, sign_name = label_text.split("\n", 1) if "\n" in label_text else ("Biển báo khác", label_text)
 
     edit_window = tk.Toplevel(top)
@@ -349,21 +530,39 @@ def edit_label(index,   on_close=None):
     name_entry.pack()
 
     def save_edit():
-        new_category = category_var.get()
-        new_name = name_entry.get().strip()
-        if not new_name:
-            messagebox.showerror("Lỗi", "Tên biển báo không được để trống!")
-            return
+        try:
+            new_category = category_var.get()
+            new_name = name_entry.get().strip()
+            if not new_name:
+                messagebox.showerror("Lỗi", "Tên biển báo không được để trống!")
+                return
 
-        labels[index] = f"{new_category}\n{new_name}"  # Lưu cả danh mục và tên biển báo
-        messagebox.showinfo("Thông báo", "Sửa thành công!")
-        print(f"Labels sau khi sửa: {get_labels_from_db()}")
-        edit_window.destroy()
-        if on_close:
-            on_close()
+            # Cập nhật label trong database
+            connection = connect_db()
+            cursor = connection.cursor()
+            new_label_text = f"{new_category}\n{new_name}"
+            
+            # Cập nhật bản ghi label trong database
+            cursor.execute("UPDATE labels SET class_name = %s WHERE class_id = %s", 
+                          (new_label_text, index))
+            connection.commit()
+            cursor.close()
+            connection.close()
+            
+            # Cập nhật labels và classNames
+            global labels, classNames
+            labels = get_labels_from_db()  # Refresh labels từ database
+            classNames = labels
+            
+            messagebox.showinfo("Thông báo", "Sửa thành công!")
+            edit_window.destroy()
+            if on_close:
+                on_close()
+        except mysql.connector.Error as e:
+            messagebox.showerror("Lỗi", f"Không thể cập nhật: {str(e)}")
         
     tk.Button(edit_window, text="Lưu", command=save_edit, bg="blue", fg="white").pack(pady=10)
-
+    
 def del_img():
     pass
 
@@ -397,8 +596,10 @@ def open_webcam():
 frame_buttons = tk.Frame(top, bg=top["bg"])
 frame_buttons.pack(side=BOTTOM,pady=50)
 
-spacer = tk.Frame(frame_buttons, width=50, bg=top["bg"])
-spacer.pack(side=RIGHT)  
+update_btn = Button(frame_buttons, text="Cập nhật", command=update_model, padx=15, pady=8, \
+                   background='#28a745', foreground='white', font=('Arial', 10, 'bold'), \
+                   relief="raised", bd=2, cursor="hand2")
+update_btn.pack(side=LEFT, padx=12, pady=5) 
 
 del_btn = Button(frame_buttons, text="Xóa biển báo", command=del_img, padx=15, pady=8, \
                  background='#007BFF', foreground='white', font=('Arial', 10, 'bold'), \
