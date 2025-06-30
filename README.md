@@ -98,7 +98,7 @@ bienbao/
 
 ## Ví dụ kết quả
 
-![Demo kết quả](docs/demo_result.png)
+![Demo kết quả](/demo.jpg)
 
 ## Hướng phát triển
 
